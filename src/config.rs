@@ -10,8 +10,8 @@ pub struct Config {
     pub permissive_id: bool,
 }
 
-impl Config {
-    pub fn default() -> Self {
+impl Default for Config {
+    fn default() -> Self {
         Self {
             payload_path: std::path::PathBuf::from("./payload"),
             wait_for_rcm: false,
