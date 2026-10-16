@@ -1,9 +1,9 @@
 mod config;
-
-const NVIDIA_TEGRA_VID: u16 = 0x0955; // Vendor ID for NVIDIA Corporation
-const NVIDIA_TEGRA_PID: u16 = 0x7321; // Product ID for NVIDIA Tegra RCM mode
+mod rcm;
 
 fn main() {
-    let config: config::Config = Default::default();
-    dbg!(&config);
+    // TODO: Send payload
+    if let Ok(vulnerable_device) = rcm::TegraRCMDevice::new() {
+        dbg!(vulnerable_device);
+    }
 }
