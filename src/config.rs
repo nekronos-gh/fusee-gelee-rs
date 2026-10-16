@@ -9,16 +9,3 @@ pub struct Config {
     pub skip_check: bool,
     pub permissive_id: bool,
 }
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            payload_path: std::path::PathBuf::from("./payload"),
-            wait_for_rcm: false,
-            vid: None,
-            pid: None,
-            skip_check: false,
-            permissive_id: false,
-        }
-    }
-}
