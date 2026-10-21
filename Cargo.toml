@@ -6,3 +6,4 @@ edition = "2024"
 [dependencies]
 regex = "1.13.1"
 walkdir = "2"
+libc = "0.2"

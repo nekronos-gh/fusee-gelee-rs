@@ -1,4 +1,5 @@
 mod error;
+mod usb;
 
 use crate::rcm::error::RcmError;
 use regex::Regex;
