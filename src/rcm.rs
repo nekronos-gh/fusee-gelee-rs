@@ -2,72 +2,41 @@ mod error;
 mod usb;
 
 use crate::rcm::error::RcmError;
-use regex::Regex;
-use std::{fs, path::PathBuf};
-use walkdir::WalkDir;
+use usb::USBDevice;
 
 const NVIDIA_TEGRA_VID: u16 = 0x0955; // Vendor ID for NVIDIA Corporation
 const NVIDIA_TEGRA_PID: u16 = 0x7321; // Product ID for NVIDIA Tegra RCM mode
 
+// USB Endpoints for RCM Device
+const BULK_EP: u32 = 0x1;
+
 #[derive(Debug)]
 pub struct TegraRCMDevice {
-    path: PathBuf,
-}
-
-// Read hexadecimal format integer from a file
-fn read_hex_from_file(path: &PathBuf) -> Option<u16> {
-    let content = fs::read_to_string(path).ok()?;
-    u16::from_str_radix(content.trim(), 16).ok()
-}
-
-// Read decimal format integer from a file
-fn read_dec_from_file(path: &PathBuf) -> Option<u16> {
-    let content = fs::read_to_string(path).ok()?;
-    u16::from_str_radix(content.trim(), 10).ok()
+    device: USBDevice,
 }
 
 impl TegraRCMDevice {
-    // Find the device Bus number and Device number through Linux sysfs
-    fn find_device() -> Result<PathBuf, RcmError> {
-        // Iterate over all devices using the xhci_hcd interface
-        let devices_re = Regex::new(r"/.*(\d{4}:\d{2}:\w{2}.\d)/usb\d/\d+-\d+$").unwrap();
-        for entry in WalkDir::new("/sys/bus/pci/drivers/xhci_hcd/")
-            .max_depth(3)
-            .follow_links(true)
-            .into_iter()
-            .filter_map(Result::ok)
-            .filter(|entry| devices_re.is_match(&entry.path().to_string_lossy()))
-        {
-            let path = entry.path();
-            let Some(vid) = read_hex_from_file(&path.join("idVendor")) else {
-                continue;
-            };
-            let Some(pid) = read_hex_from_file(&path.join("idProduct")) else {
-                continue;
-            };
-
-            if vid == NVIDIA_TEGRA_VID && pid == NVIDIA_TEGRA_PID {
-                let Some(busnum) = read_dec_from_file(&path.join("busnum")) else {
-                    continue;
-                };
-                let Some(devnum) = read_dec_from_file(&path.join("devnum")) else {
-                    continue;
-                };
-                println!("{}, {}", busnum, devnum);
-                return Ok(std::path::PathBuf::from(format!(
-                    "/dev/bus/usb/{busnum:03}/{devnum:03}"
-                )));
-            }
-        }
-        Err(RcmError::DeviceNotFound)
+    pub fn send_payload(&self) -> Result<(), RcmError> {
+        let mut payload = [0xDE, 0xAD, 0xBE, 0xEF];
+        self.device
+            .write_bulk(BULK_EP, &mut payload)
+            .map_err(RcmError::IO)?;
+        Ok(())
     }
 
-    pub fn read(&self) {}
-
-    pub fn write(&self) {}
+    pub fn trigger_vulnerability(&self) -> Result<[u8; 256], RcmError> {
+        let mut buffer = [0u8; 256];
+        self.device
+            .write_control(&mut buffer)
+            .map_err(RcmError::IO)?;
+        Ok(buffer)
+    }
 
     pub fn new() -> Result<Self, RcmError> {
-        let path = Self::find_device()?;
-        Ok(Self { path })
+        if let Some(device) = USBDevice::find_device(NVIDIA_TEGRA_VID, NVIDIA_TEGRA_PID) {
+            device.claim_interface(0).map_err(RcmError::IO)?;
+            return Ok(Self { device });
+        }
+        Err(RcmError::DeviceNotFound)
     }
 }
