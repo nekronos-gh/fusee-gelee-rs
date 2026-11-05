@@ -1,3 +1,4 @@
+use super::error::RcmError;
 use regex::Regex;
 use std::mem::size_of;
 use std::os::fd::AsRawFd;
@@ -111,7 +112,7 @@ pub struct USBDevice {
 
 impl USBDevice {
     // Find the device Bus number and Device number through Linux sysfs
-    pub fn find_device(device_vid: u16, device_pid: u16) -> Option<USBDevice> {
+    pub fn find_device(device_vid: u16, device_pid: u16) -> Result<USBDevice, RcmError> {
         // Iterate over all devices using the xhci_hcd interface
         let devices_re = Regex::new(r"/.*(\d{4}:\d{2}:\w{2}.\d)/usb\d/\d+-\d+$").unwrap();
         for entry in WalkDir::new("/sys/bus/pci/drivers/xhci_hcd/")
@@ -144,34 +145,34 @@ impl USBDevice {
                 if let Ok(device_file) =
                     OpenOptions::new().read(true).write(true).open(&device_node)
                 {
-                    return Some(Self { device_file });
+                    return Ok(Self { device_file });
                 }
             }
         }
-        None
-    }
-
-    // Claim interface
-    pub fn claim_interface(&self, interface: u32) -> std::io::Result<()> {
-        let mut claim_if_request = UsbClaimInterface { interface };
-        self.issue_request(&mut claim_if_request)
+        Err(RcmError::DeviceNotFound)
     }
 
     // Send a USB request through ioctl
-    fn issue_request<T: IoctlRequest>(&self, request: &mut T) -> std::io::Result<()> {
+    fn issue_request<T: IoctlRequest>(&self, request: &mut T) -> Result<(), RcmError> {
         unsafe {
             let device_fd = self.device_file.as_raw_fd();
             // Synchronous write call
             let ret = libc::ioctl(device_fd, T::IOCTL, request as *mut T);
             if ret < 0 {
-                return Err(std::io::Error::last_os_error());
+                return Err(RcmError::IO(std::io::Error::last_os_error()));
             }
         };
         Ok(())
     }
 
+    // Claim interface
+    pub fn claim_interface(&self, interface: u32) -> Result<(), RcmError> {
+        let mut claim_if_request = UsbClaimInterface { interface };
+        self.issue_request(&mut claim_if_request)
+    }
+
     // Send a Bulk request
-    pub fn issue_bulk_request(&self, endpoint: u32, buf: &mut [u8]) -> std::io::Result<()> {
+    pub fn issue_bulk_request(&self, endpoint: u32, buf: &mut [u8]) -> Result<(), RcmError> {
         let mut bulk_transfer = UsbBulkTransfer {
             ep: endpoint,
             len: buf.len() as u32,
@@ -182,7 +183,7 @@ impl USBDevice {
     }
 
     // Send a Control request
-    pub fn issue_control_request(&self, buf: &mut [u8]) -> std::io::Result<()> {
+    pub fn issue_control_request(&self, buf: &mut [u8]) -> Result<(), RcmError> {
         // It is important to note that this is not an usb driver, therefore, we will set some
         // values in the control request to specific defaults. The idea is to use this to trigger
         // the vulnerability
