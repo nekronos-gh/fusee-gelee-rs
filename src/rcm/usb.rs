@@ -192,7 +192,7 @@ impl USBDevice {
         const USB_TYPE_STANDARD: u8 = 0x00;
         const USB_RECIP_ENDPOINT: u8 = 0x02;
         const USB_REQ_GET_STATUS: u8 = 0x0;
-        // The vulnerable code in the switch executes on Get status requests where the recipient is
+        // The vulnerable code in executes on Get status requests where the recipient is
         // an endpoint
         let mut control_transfer = UsbControlTransfer {
             req_type: USB_DIR_IN | USB_TYPE_STANDARD | USB_RECIP_ENDPOINT, // Direction | Type | Recipient
