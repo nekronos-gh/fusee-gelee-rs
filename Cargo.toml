@@ -1,6 +1,6 @@
 [package]
-name = "nova-switch"
-version = "0.1.0"
+name = "fusee-gelee-exploit"
+version = "0.0.1"
 edition = "2024"
 
 [dependencies]
